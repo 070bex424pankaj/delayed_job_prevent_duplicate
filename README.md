@@ -1,8 +1,8 @@
 # DelayedJobPreventDuplicate
 
-The purpose of this gem is to prevent to re-enqueue on DelayedJob a task already enqueued.  
-So we set a "signature" attached to every task enqueued which is a composite from the class and the id of the object, and the method called.  
-And then when creating a new job we look in the "pending" jobs if there is another one with the same signature (not in the "working" one because a task can be executed and yet you want to re-excute it because of any change). 
+The purpose of this gem is to prevent re-enqueueing on DelayedJob a task already enqueued.  
+A "signature" is attached to every task which is a composite of the class, id, and method called.  
+When creating a new job, the gem checks for an existing pending job with the same signature.
 
 ## Note
 
@@ -30,6 +30,72 @@ rails g delayed_job_prevent_duplicate
   
 All should be fine now!  
 
+## Duplicate Prevention Strategies
+
+The gem supports three strategies for preventing duplicate jobs:
+
+### 1. `:validation` (Default — Legacy behavior)
+
+Uses a SELECT query to check for existing pending jobs with the same signature before inserting.
+No unique index required, but adds one SELECT query per enqueue.
+
+```ruby
+# This is the default, no configuration needed
+DelayedDuplicatePreventionPlugin.strategy = :validation
+```
+
+### 2. `:insert_ignore` (Recommended for MySQL/MariaDB)
+
+Uses MySQL's `INSERT IGNORE` statement with a unique index on `signature`.
+Silently skips duplicates at the database level — no SELECT query, no Ruby exception.
+
+```ruby
+# In an initializer (e.g., config/initializers/delayed_job.rb)
+DelayedDuplicatePreventionPlugin.strategy = :insert_ignore
+```
+
+**Requires** a unique index on the `signature` column (added by the generator migration).
+
+### 3. `:on_duplicate_key` (Alternative for MySQL/MariaDB)
+
+Uses MySQL's `INSERT ... ON DUPLICATE KEY UPDATE` with a unique index on `signature`.
+On conflict, updates the existing row's `updated_at` timestamp. No SELECT, no exception.
+
+```ruby
+DelayedDuplicatePreventionPlugin.strategy = :on_duplicate_key
+```
+
+**Requires** a unique index on the `signature` column (added by the generator migration).
+
+### How the unique index strategies work
+
+When using `:insert_ignore` or `:on_duplicate_key`:
+
+1. The signature is still generated the same way (before validation callback)
+2. Instead of doing a SELECT to check for duplicates, the INSERT itself handles conflicts
+3. When a worker **picks up a job** to execute it, the signature is **cleared** (`SET signature = NULL`), 
+   allowing the same method to be re-enqueued after the job starts running
+4. This preserves the original behavior where only pending/queued jobs block re-enqueueing
+
+### Performance comparison
+
+| Strategy | SELECT per enqueue | INSERT per enqueue | Exception on dupe | Best for |
+|---|---|---|---|---|
+| `:validation` | Yes (1 query) | Yes | No (validation error) | Low volume, any DB |
+| `:insert_ignore` | No | Yes | No | High volume, MySQL |
+| `:on_duplicate_key` | No | Yes | No | High volume, MySQL |
+
+## Custom Signatures
+
+You can define a custom `signature` method on model objects to control the dedup key:
+
+```ruby
+class MyModel < ApplicationRecord
+  def signature(method_name = nil, args = nil)
+    "MyModel:#{id}##{method_name}"
+  end
+end
+```
 
 ## Contributing
 
@@ -41,6 +107,6 @@ The gem is available as open source under the terms of the [MIT License](https:/
 
 ## Bibliography
 
-https://groups.google.com/g/delayed_job/c/gZ9bFCdZrsk#2a05c39a192e630c
+https://groups.google.com/g/delayed_job/c/gZ9bFCdZrsk\#2a05c39a192e630c
 https://github.com/collectiveidea/delayed_job/blob/master/lib/delayed/backend/base.rb
 https://github.com/ignatiusreza/activejob-trackable
