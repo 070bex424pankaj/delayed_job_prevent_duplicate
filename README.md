@@ -77,6 +77,22 @@ When using `:insert_ignore` or `:on_duplicate_key`:
    allowing the same method to be re-enqueued after the job starts running
 4. This preserves the original behavior where only pending/queued jobs block re-enqueueing
 
+### Deduplication scope
+
+The strategies differ in **what** they consider a duplicate:
+
+| Strategy | Dedup key | Behavior with same signature, different args |
+|---|---|---|
+| `:validation` | signature + args | Both jobs are enqueued (args differ) |
+| `:insert_ignore` | signature only | Second job is silently skipped |
+| `:on_duplicate_key` | signature only | Second job is silently skipped |
+
+The `:validation` strategy performs a SELECT query and compares both the signature and serialized args, so two jobs with the same class/id/method but different arguments are **not** considered duplicates.
+
+The `:insert_ignore` and `:on_duplicate_key` strategies rely on a database unique index on the `signature` column, so deduplication is based on signature alone — regardless of arguments.
+
+> **Note:** Because the generator migration adds a unique index on `signature`, the `:validation` strategy will also prevent same-signature inserts at the DB level — even when args differ. This is handled gracefully (no exception raised), but it means the unique index makes all strategies behave consistently at the signature level.
+
 ### Performance comparison
 
 | Strategy | SELECT per enqueue | INSERT per enqueue | Exception on dupe | Best for |

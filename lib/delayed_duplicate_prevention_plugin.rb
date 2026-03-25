@@ -53,10 +53,16 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
         # and run validations (except prevent_duplicate which is skipped)
         return false unless valid?
 
-        _insert_with_duplicate_handling(strategy)
+        insert_with_duplicate_handling(strategy)
       else
         super
       end
+    rescue ActiveRecord::RecordNotUnique
+      # Gracefully handle the unique index constraint when using :validation strategy.
+      # This occurs when two jobs share the same signature but have different args —
+      # the validation passes (args differ) but the DB unique index rejects the insert.
+      log_duplicate_not_unique
+      false
     end
 
     private
@@ -69,18 +75,17 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     end
 
     def generate_signature
-      begin
-        # NOTE: placing this block at the top since class method invocations also have Delayed::PerformableMethod as payload_object
-        if payload_object.respond_to?(:object) && payload_object.object&.is_a?(Class) && !payload_object.respond_to?(:signature)
-          generate_signature_for_class_method
-        elsif payload_object.respond_to?(:signature) || payload_object.is_a?(Delayed::PerformableMethod)
-          generate_signature_for_job_payload
-        else
-          generate_signature_random
-        end
-      rescue
-        log_signature_failed
+      # NOTE: placing this block at the top since class method invocations also have Delayed::PerformableMethod as payload_object
+      if payload_object.respond_to?(:object) && payload_object.object&.is_a?(Class) && !payload_object.respond_to?(:signature)
+        generate_signature_for_class_method
+      elsif payload_object.respond_to?(:signature) || payload_object.is_a?(Delayed::PerformableMethod)
+        generate_signature_for_job_payload
+      else
+        generate_signature_random
       end
+    rescue StandardError => e
+      Rails.logger.error "DelayedDuplicatePreventionPlugin could not generate the signature correctly. Error: #{e.message}"
+      nil
     end
 
     # this is to prevent ActiveRecord::ValueTooLong error for some cases with complex/long args
@@ -135,9 +140,7 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
       SecureRandom.uuid
     end
 
-    def log_signature_failed
-      Rails.logger.error "DelayedDuplicatePreventionPlugin could not generate the signature correctly."
-    end
+
 
     def get_args
       self.payload_object.try(:args) || []
@@ -158,74 +161,78 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     # using raw SQL to avoid ActiveRecord raising RecordNotUnique.
     #
     # Returns true if a row was inserted, false if it was a duplicate.
-    def _insert_with_duplicate_handling(strategy)
-      # Ensure timestamps are set
+    def insert_with_duplicate_handling(strategy)
+      ensure_timestamps_set
+      sql = build_insert_sql(strategy)
+      self.class.connection.execute(sql)
+
+      if row_actually_inserted?
+        finalize_inserted_record
+      else
+        log_duplicate_skipped(strategy)
+        false
+      end
+    end
+
+    def ensure_timestamps_set
       current_time = self.class.current_time_from_proper_timezone
       self.created_at ||= current_time
       self.updated_at ||= current_time
       self.run_at ||= current_time
+    end
 
+    def build_insert_sql(strategy)
       attrs = attributes_for_create(attribute_names)
       column_names = attrs.map { |name| self.class.connection.quote_column_name(name) }
       values = attrs.map { |name| self.class.connection.quote(_read_attribute(name)) }
-
       table = self.class.quoted_table_name
+      columns_sql = column_names.join(', ')
+      values_sql = values.join(', ')
 
-      sql = case strategy
-            when :insert_ignore
-              "INSERT IGNORE INTO #{table} (#{column_names.join(', ')}) VALUES (#{values.join(', ')})"
-            when :on_duplicate_key
-              "INSERT INTO #{table} (#{column_names.join(', ')}) VALUES (#{values.join(', ')}) " \
-              "ON DUPLICATE KEY UPDATE updated_at = VALUES(updated_at)"
-            end
+      case strategy
+      when :insert_ignore
+        "INSERT IGNORE INTO #{table} (#{columns_sql}) VALUES (#{values_sql})"
+      when :on_duplicate_key
+        "INSERT INTO #{table} (#{columns_sql}) VALUES (#{values_sql}) " \
+        "ON DUPLICATE KEY UPDATE updated_at = VALUES(updated_at)"
+      end
+    end
 
-      self.class.connection.execute(sql)
+    # Check ROW_COUNT() to determine if a row was actually inserted.
+    # - INSERT IGNORE:                        ROW_COUNT() = 1 (inserted), 0 (skipped)
+    # - INSERT ... ON DUPLICATE KEY UPDATE:   ROW_COUNT() = 1 (inserted), 2 (updated existing)
+    #
+    # We must NOT rely on LAST_INSERT_ID() alone because it retains the
+    # previous auto-increment value when INSERT IGNORE skips a row,
+    # which would incorrectly assign the prior job's id to this object.
+    def row_actually_inserted?
+      affected_rows = fetch_scalar("SELECT ROW_COUNT() AS cnt")
+      affected_rows == 1
+    end
 
-      # Check ROW_COUNT() to determine if a row was actually inserted.
-      # - INSERT IGNORE:              ROW_COUNT() = 1 (inserted), 0 (skipped)
-      # - INSERT ... ON DUPLICATE KEY UPDATE: ROW_COUNT() = 1 (inserted), 2 (updated existing)
-      #
-      # We must NOT rely on LAST_INSERT_ID() alone because it retains the
-      # previous auto-increment value when INSERT IGNORE skips a row,
-      # which would incorrectly assign the prior job's id to this object.
-      row_count_result = self.class.connection.execute("SELECT ROW_COUNT() AS cnt").first
-      affected_rows = if row_count_result.is_a?(Hash)
-                        row_count_result["cnt"]
-                      elsif row_count_result.is_a?(Array)
-                        row_count_result[0]
-                      else
-                        row_count_result
-                      end
+    def finalize_inserted_record
+      self.id = fetch_scalar("SELECT LAST_INSERT_ID() AS id")
+      changes_applied
+      @new_record = false
+      true
+    end
 
-      actually_inserted = case strategy
-                          when :insert_ignore
-                            affected_rows == 1
-                          when :on_duplicate_key
-                            affected_rows == 1  # 1 = inserted, 2 = updated existing
-                          end
+    def log_duplicate_skipped(strategy)
+      Rails.logger.info "DelayedJob duplicate skipped via #{strategy} for signature: #{self.signature}"
+    end
 
-      if actually_inserted
-        # Fetch the real auto-increment id for the newly inserted row
-        last_id_result = self.class.connection.execute("SELECT LAST_INSERT_ID() AS id").first
-        inserted_id = if last_id_result.is_a?(Hash)
-                        last_id_result["id"]
-                      elsif last_id_result.is_a?(Array)
-                        last_id_result[0]
-                      else
-                        last_id_result
-                      end
+    def log_duplicate_not_unique
+      Rails.logger.info "DelayedJob duplicate prevented by unique index for signature: #{self.signature}"
+    end
 
-        self.id = inserted_id
-        changes_applied
-        @new_record = false
-        true
-      else
-        # Duplicate was silently ignored / existing row updated
-        if defined?(Rails) && Rails.respond_to?(:logger) && Rails.logger
-          Rails.logger.info "DelayedJob duplicate skipped via #{strategy} for signature: #{self.signature}"
-        end
-        # Keep @new_record = true so persisted? correctly returns false
-        false
+    # Extracts a single scalar value from a one-column SQL result,
+    # handling both Hash and Array result formats across adapters.
+    def fetch_scalar(sql)
+      result = self.class.connection.execute(sql).first
+      case result
+      when Hash  then result.values.first
+      when Array then result[0]
+      else result
       end
     end
   end
