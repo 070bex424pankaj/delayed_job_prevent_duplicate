@@ -269,15 +269,68 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     end
   end
 
-  # Lifecycle callback to clear the signature when a job is picked up by a worker.
-  # This allows the same method to be re-enqueued after the job starts running,
-  # which preserves the original behavior where only pending (attempts=0, locked_at=nil)
-  # jobs were checked for duplicates.
-  callbacks do |lifecycle|
-    lifecycle.before(:perform) do |_worker, job|
-      if DelayedDuplicatePreventionPlugin.strategy != :validation
-        job.update_column(:signature, nil) if job.respond_to?(:signature)
+  LOCKED_SUFFIX = "-locked"
+
+  # Monkey-patch module for Delayed::Job to append "-locked" to the signature
+  # atomically in the same UPDATE query that locks the job.
+  #
+  # This frees the unique index slot so the same job can be re-enqueued while
+  # the current one is running. Because the generator migration adds a unique index
+  # on `signature`, all strategies need this — a locked row still occupies the
+  # index slot until the job is deleted after completion.
+  #
+  # Applied via prepend on Delayed::Job's singleton class for all strategies.
+  module SignatureOnLock
+    # MySQL reserve strategy: SELECT candidates, then UPDATE one-by-one to lock.
+    def reserve_with_scope_using_optimized_mysql(ready_scope, worker, now)
+      now = now.change(usec: 0)
+
+      jobs = []
+      ready_scope.limit(worker.read_ahead).each do |job|
+        break if jobs.count >= worker.max_claims
+
+        lock_sql = build_lock_sql_with_signature(now, worker.name)
+        next unless ready_scope.where(id: job.id).update_all(lock_sql) == 1
+
+        job.assign_attributes(locked_at: now, locked_by: worker.name)
+        job.signature = "#{job.signature}#{DelayedDuplicatePreventionPlugin::LOCKED_SUFFIX}" if job.signature.present?
+        job.send(:changes_applied)
+        jobs << job
       end
+
+      jobs
+    end
+
+    # Default reserve strategy (fallback for non-MySQL/PG/MSSQL adapters).
+    def reserve_with_scope_using_default_sql(ready_scope, worker, now)
+      lock_sql = build_lock_sql_with_signature(now, worker.name)
+
+      jobs = []
+      ready_scope.limit(worker.read_ahead).select(:id).each do |job|
+        break if jobs.count >= worker.max_claims
+        next unless ready_scope.where(id: job.id).update_all(lock_sql) == 1
+
+        jobs << find(job.id)
+      end
+
+      jobs
+    end
+
+    private
+
+    # Builds a raw SQL SET clause that locks the job AND appends "-locked" to the signature
+    # in a single atomic UPDATE. Uses LEFT() to prevent exceeding the 255-char column limit.
+    def build_lock_sql_with_signature(now, worker_name)
+      quoted_now = connection.quote(now)
+      quoted_worker = connection.quote(worker_name)
+      suffix = DelayedDuplicatePreventionPlugin::LOCKED_SUFFIX
+      max_len = 255 - suffix.length
+
+      "locked_at = #{quoted_now}, " \
+      "locked_by = #{quoted_worker}, " \
+      "signature = CASE WHEN signature IS NOT NULL " \
+        "THEN CONCAT(LEFT(signature, #{max_len}), '#{suffix}') " \
+        "ELSE signature END"
     end
   end
 end

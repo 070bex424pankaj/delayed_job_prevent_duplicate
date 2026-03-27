@@ -33,6 +33,12 @@ module DelayedJobPreventDuplicate
     end
 
     Delayed::Worker.plugins << DelayedDuplicatePreventionPlugin
+
+    # Patch the reserve methods to append "-locked" to the signature in the same
+    # UPDATE that locks the job. This frees the unique index slot so the same job
+    # can be re-enqueued while the current one is running.
+    # Applied for all strategies when a unique index on signature is present.
+    Delayed::Job.singleton_class.prepend(DelayedDuplicatePreventionPlugin::SignatureOnLock)
   end
 
   # NOTE: `delayed` gem moves the ActiveRecord class into app/models
