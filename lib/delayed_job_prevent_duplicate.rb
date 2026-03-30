@@ -38,7 +38,10 @@ module DelayedJobPreventDuplicate
     # UPDATE that locks the job. This frees the unique index slot so the same job
     # can be re-enqueued while the current one is running.
     # Applied for all strategies when a unique index on signature is present.
-    Delayed::Job.singleton_class.prepend(DelayedDuplicatePreventionPlugin::SignatureOnLock)
+    #
+    # Uses the self.prepended(base) pattern: prepending on Delayed::Job triggers
+    # the callback which auto-extends its singleton_class with ClassMethods.
+    Delayed::Job.prepend(DelayedDuplicatePreventionPlugin::SignatureOnLock)
   end
 
   # NOTE: `delayed` gem moves the ActiveRecord class into app/models
