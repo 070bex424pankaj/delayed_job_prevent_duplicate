@@ -306,7 +306,8 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
           next unless ready_scope.where(id: job.id).update_all(lock_sql) == 1
 
           job.assign_attributes(locked_at: now, locked_by: worker.name)
-          job.signature = "#{job.signature}#{DelayedDuplicatePreventionPlugin::LOCKED_SUFFIX}" if job.signature.present?
+          suffix = DelayedDuplicatePreventionPlugin::LOCKED_SUFFIX
+          job.signature = "#{job.signature}#{suffix}" if job.signature.present? && !job.signature.end_with?(suffix)
           job.send(:changes_applied)
           jobs << job
         end
@@ -333,6 +334,8 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
 
       # Builds a raw SQL SET clause that locks the job AND appends "-locked" to the signature
       # in a single atomic UPDATE. Uses LEFT() to prevent exceeding the 255-char column limit.
+      # The CASE guard makes the suffix idempotent: if the signature already ends with "-locked"
+      # (e.g. after a failed job is rescheduled and re-reserved), the suffix is not appended again.
       def build_lock_sql_with_signature(now, worker_name)
         quoted_now = connection.quote(now)
         quoted_worker = connection.quote(worker_name)
@@ -341,9 +344,11 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
 
         "locked_at = #{quoted_now}, " \
         "locked_by = #{quoted_worker}, " \
-        "signature = CASE WHEN signature IS NOT NULL " \
-          "THEN CONCAT(LEFT(signature, #{max_len}), '#{suffix}') " \
-          "ELSE signature END"
+        "signature = CASE " \
+          "WHEN signature IS NULL THEN signature " \
+          "WHEN signature LIKE '%#{suffix}' THEN signature " \
+          "ELSE CONCAT(LEFT(signature, #{max_len}), '#{suffix}') " \
+        "END"
       end
     end
   end
