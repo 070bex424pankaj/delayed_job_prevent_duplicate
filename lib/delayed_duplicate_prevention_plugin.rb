@@ -26,6 +26,11 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     end
   end
 
+  # Raised in before(:perform) when a job's signature shows it was stale-stolen
+  # at least once. Skips execution entirely so the job is destroyed through the
+  # normal reschedule path without running its potentially slow/broken code.
+  StaleJobDetectedError = Class.new(RuntimeError)
+
   # Suffix appended to a job's signature when it is reserved (locked) by a worker.
   # Frees the unique index slot so the same job can be re-enqueued while running.
   LOCKED_SUFFIX = "-locked"
@@ -41,9 +46,10 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
   # no ceiling and the job can cycle indefinitely (zombie loop).
   #
   # Fix: before each perform, count how many extra "-locked" suffixes have
-  # accumulated (each beyond the first = one stale steal) and write that count
-  # to `attempts`. Combined with Worker#reschedule doing `attempts += 1` on
-  # failure, the job is destroyed once stale_steals + 1 >= max_attempts.
+  # accumulated (each beyond the first = one stale steal). Pre-charge attempts
+  # to max_attempts-1 and raise StaleJobDetectedError to skip execution entirely.
+  # DJ rescues the error, reschedule does attempts += 1 = max_attempts, and
+  # fail! destroys the job. The job code never runs.
   #
   # NOTE: this hook MUST live in a `callbacks` block so that Delayed::Plugin
   # re-registers it every time Delayed::Worker#initialize calls
@@ -51,7 +57,14 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
   callbacks do |lifecycle|
     lifecycle.before(:perform) do |_worker, job|
       stale_pickups = job.signature.to_s.scan(LOCKED_SUFFIX).size - 1
-      job.update_column(:attempts, stale_pickups) if stale_pickups > 0
+      if stale_pickups > 0
+        # Set in-memory so reschedule's `attempts += 1` lands at exactly max_attempts.
+        # update_column writes to DB durably so the count survives if this worker is also killed.
+        job.attempts = Delayed::Worker.max_attempts - 1
+        job.update_column(:attempts, Delayed::Worker.max_attempts - 1)
+        raise StaleJobDetectedError,
+          "Job #{job.id} (#{job.name}) was stale-stolen #{stale_pickups} time(s); skipping execution and destroying"
+      end
     end
   end
 
