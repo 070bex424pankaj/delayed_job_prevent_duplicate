@@ -26,6 +26,35 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     end
   end
 
+  # Suffix appended to a job's signature when it is reserved (locked) by a worker.
+  # Frees the unique index slot so the same job can be re-enqueued while running.
+  LOCKED_SUFFIX = "-locked"
+
+  # Zombie-loop prevention.
+  #
+  # Problem: when a worker crashes or is SIGTERM'd mid-job, the job row keeps
+  # locked_at set but attempts stays at 0. Another worker later steals the job
+  # by overwriting locked_at/locked_by without incrementing attempts. The
+  # SignatureOnLock module appends another "-locked" to the signature on each
+  # steal, so the number of extra suffixes is a reliable stale-steal counter.
+  # Because attempts is never incremented by the crash, max_attempts provides
+  # no ceiling and the job can cycle indefinitely (zombie loop).
+  #
+  # Fix: before each perform, count how many extra "-locked" suffixes have
+  # accumulated (each beyond the first = one stale steal) and write that count
+  # to `attempts`. Combined with Worker#reschedule doing `attempts += 1` on
+  # failure, the job is destroyed once stale_steals + 1 >= max_attempts.
+  #
+  # NOTE: this hook MUST live in a `callbacks` block so that Delayed::Plugin
+  # re-registers it every time Delayed::Worker#initialize calls
+  # Delayed.setup_lifecycle (which replaces the entire lifecycle object).
+  callbacks do |lifecycle|
+    lifecycle.before(:perform) do |_worker, job|
+      stale_pickups = job.signature.to_s.scan(LOCKED_SUFFIX).size - 1
+      job.update_column(:attempts, stale_pickups) if stale_pickups > 0
+    end
+  end
+
   module SignatureConcern
     extend ActiveSupport::Concern
 
@@ -272,8 +301,6 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
       false
     end
   end
-
-  LOCKED_SUFFIX = "-locked"
 
   # Prepend module for Delayed::Job to append "-locked" to the signature
   # atomically in the same UPDATE query that locks the job.
