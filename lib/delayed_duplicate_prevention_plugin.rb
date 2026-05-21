@@ -54,10 +54,6 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     lifecycle.before(:perform) do |_worker, job|
       stale_pickups = job.signature.to_s.scan(LOCKED_SUFFIX).size - 1
       if stale_pickups > 0
-        # Write before raising: if this worker is also killed, the count is already saved
-        # and the next worker will detect the stale pickup again.
-        job.attempts = Delayed::Worker.max_attempts - 1
-        job.update_column(:attempts, Delayed::Worker.max_attempts - 1)
         raise StaleJobDetectedError,
           "Job #{job.id} (#{job.name}) was stale-stolen #{stale_pickups} time(s); skipping execution and destroying"
       end
