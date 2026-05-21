@@ -26,32 +26,45 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     end
   end
 
-  # Suffix appended to a job's signature when it is reserved (locked) by a worker.
-  # Frees the unique index slot so the same job can be re-enqueued while running.
+  # Appended to a job's signature each time a worker locks it for processing.
+  # Freeing the unique index slot lets the same job be re-enqueued while the
+  # current run is still in progress.
   LOCKED_SUFFIX = "-locked"
 
-  # Zombie-loop prevention.
+  # Raised when we detect a job was previously picked up by a worker that died
+  # without recording a failure — most commonly a MySQL query timeout that
+  # kills the Fargate task before Ruby even sees the exception, or an OOM.
+  # Raising this skips the job's code entirely and sends it straight to
+  # destruction via DJ's normal rescue path.
+  StaleJobDetectedError = Class.new(RuntimeError)
+
+  # Every time a worker picks up a job it stamps "-locked" onto the signature.
+  # If the worker is killed by the OS (Fargate replacement, OOM, SIGTERM) before
+  # finishing, the stamp stays — no exception is raised, so `attempts` never
+  # moves. The next worker appends another "-locked" without knowing what
+  # happened. This repeats indefinitely because `max_attempts` is only checked
+  # after a Ruby exception, which a dead process never produces.
   #
-  # Problem: when a worker crashes or is SIGTERM'd mid-job, the job row keeps
-  # locked_at set but attempts stays at 0. Another worker later steals the job
-  # by overwriting locked_at/locked_by without incrementing attempts. The
-  # SignatureOnLock module appends another "-locked" to the signature on each
-  # steal, so the number of extra suffixes is a reliable stale-steal counter.
-  # Because attempts is never incremented by the crash, max_attempts provides
-  # no ceiling and the job can cycle indefinitely (zombie loop).
+  # A job carrying two or more "-locked" suffixes has been silently abandoned
+  # at least once. Rather than run it again (potentially burning another 60s on
+  # a slow query that will time out anyway), we count the extra stamps, skip
+  # the job code entirely, and force destruction immediately.
   #
-  # Fix: before each perform, count how many extra "-locked" suffixes have
-  # accumulated (each beyond the first = one stale steal) and write that count
-  # to `attempts`. Combined with Worker#reschedule doing `attempts += 1` on
-  # failure, the job is destroyed once stale_steals + 1 >= max_attempts.
-  #
-  # NOTE: this hook MUST live in a `callbacks` block so that Delayed::Plugin
-  # re-registers it every time Delayed::Worker#initialize calls
-  # Delayed.setup_lifecycle (which replaces the entire lifecycle object).
+  # NOTE: this block must live inside `callbacks` so that Delayed::Plugin
+  # re-registers the hook every time a new worker is created. Hooks registered
+  # directly on Delayed::Worker.lifecycle are wiped when each worker starts.
   callbacks do |lifecycle|
     lifecycle.before(:perform) do |_worker, job|
       stale_pickups = job.signature.to_s.scan(LOCKED_SUFFIX).size - 1
-      job.update_column(:attempts, stale_pickups) if stale_pickups > 0
+      if stale_pickups > 0
+        # Write to the DB before raising. If this worker is also killed before
+        # DJ's rescue path runs, the count is already saved — the next worker
+        # will detect the stale steal again and raise again.
+        job.attempts = Delayed::Worker.max_attempts - 1
+        job.update_column(:attempts, Delayed::Worker.max_attempts - 1)
+        raise StaleJobDetectedError,
+          "Job #{job.id} (#{job.name}) was stale-stolen #{stale_pickups} time(s); skipping execution and destroying"
+      end
     end
   end
 
