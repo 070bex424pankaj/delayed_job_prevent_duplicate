@@ -26,40 +26,36 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     end
   end
 
-  # Appended to a job's signature each time a worker locks it for processing.
-  # Freeing the unique index slot lets the same job be re-enqueued while the
-  # current run is still in progress.
+  # Appended to the signature each time a worker locks the job.
+  # Frees the unique index slot so the same job can be re-enqueued while it is running.
   LOCKED_SUFFIX = "-locked"
 
-  # Raised when we detect a job was previously picked up by a worker that died
-  # without recording a failure — most commonly a MySQL query timeout that
-  # kills the Fargate task before Ruby even sees the exception, or an OOM.
-  # Raising this skips the job's code entirely and sends it straight to
-  # destruction via DJ's normal rescue path.
+  # Raised when a job was previously claimed by a worker that died without clearing its lock.
+  #
+  # Primary cause: a MySQL query timeout kills the Fargate task at the OS level before Ruby
+  # sees the exception. locked_at is never cleared. Once the lock expires, another worker
+  # claims the job and appends another -locked. OOM kills have the same effect.
+  #
+  # Raising here skips the job code entirely and forces destruction via DJ's normal rescue path.
   StaleJobDetectedError = Class.new(RuntimeError)
 
-  # Every time a worker picks up a job it stamps "-locked" onto the signature.
-  # If the worker is killed by the OS (Fargate replacement, OOM, SIGTERM) before
-  # finishing, the stamp stays — no exception is raised, so `attempts` never
-  # moves. The next worker appends another "-locked" without knowing what
-  # happened. This repeats indefinitely because `max_attempts` is only checked
-  # after a Ruby exception, which a dead process never produces.
+  # Each worker appends -locked to the signature when it claims a job.
+  # If MySQL kills the Fargate task mid-query (or an OOM occurs), the process dies at the
+  # OS level — Ruby never gets a chance to run, so locked_at is not cleared and attempts
+  # is not incremented. Once the lock expires, another worker claims the job and appends
+  # another -locked. This repeats indefinitely.
   #
-  # A job carrying two or more "-locked" suffixes has been silently abandoned
-  # at least once. Rather than run it again (potentially burning another 60s on
-  # a slow query that will time out anyway), we count the extra stamps, skip
-  # the job code entirely, and force destruction immediately.
+  # Two or more -locked suffixes means the job was silently abandoned at least once.
+  # Rather than run the same query that likely caused the timeout, we skip it and destroy.
   #
-  # NOTE: this block must live inside `callbacks` so that Delayed::Plugin
-  # re-registers the hook every time a new worker is created. Hooks registered
-  # directly on Delayed::Worker.lifecycle are wiped when each worker starts.
+  # NOTE: must be inside `callbacks` — hooks on Delayed::Worker.lifecycle are wiped each
+  # time a new worker starts. Plugins re-register their callbacks automatically.
   callbacks do |lifecycle|
     lifecycle.before(:perform) do |_worker, job|
       stale_pickups = job.signature.to_s.scan(LOCKED_SUFFIX).size - 1
       if stale_pickups > 0
-        # Write to the DB before raising. If this worker is also killed before
-        # DJ's rescue path runs, the count is already saved — the next worker
-        # will detect the stale steal again and raise again.
+        # Write before raising: if this worker is also killed, the count is already saved
+        # and the next worker will detect the stale pickup again.
         job.attempts = Delayed::Worker.max_attempts - 1
         job.update_column(:attempts, Delayed::Worker.max_attempts - 1)
         raise StaleJobDetectedError,
@@ -315,19 +311,11 @@ class DelayedDuplicatePreventionPlugin < Delayed::Plugin
     end
   end
 
-  # Prepend module for Delayed::Job to append "-locked" to the signature
-  # atomically in the same UPDATE query that locks the job.
-  #
-  # This frees the unique index slot so the same job can be re-enqueued while
-  # the current one is running. Because the generator migration adds a unique index
-  # on `signature`, all strategies need this — a locked row still occupies the
-  # index slot until the job is deleted after completion.
+  # Prepend to Delayed::Job to append "-locked" to the signature atomically
+  # in the same UPDATE that locks the job. Frees the unique index slot so the
+  # same job can be re-enqueued while it runs.
   #
   # Usage: Delayed::Job.prepend(DelayedDuplicatePreventionPlugin::SignatureOnLock)
-  #
-  # The `self.prepended` callback automatically extends the host class's
-  # singleton with ClassMethods, keeping instance- and class-level concerns
-  # in a single, extensible module.
   module SignatureOnLock
     def self.prepended(base)
       base.singleton_class.prepend(ClassMethods)
